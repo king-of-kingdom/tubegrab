@@ -12,21 +12,25 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Directories
-const DOWNLOADS_DIR = '/tmp/downloads';
-if (!fs.existsSync(DOWNLOADS_DIR)) {
-    fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
-}
+// Directories - Use /tmp for Render.com
+const isProduction = process.env.NODE_ENV === 'production' || process.env.RENDER;
+const DOWNLOADS_DIR = isProduction ? '/tmp/downloads' : path.join(__dirname, 'downloads');
+const BIN_DIR = isProduction ? '/tmp/bin' : path.join(__dirname, 'bin');
+const YTDLP_PATH = path.join(BIN_DIR, 'yt-dlp');
 
-// yt-dlp path (Linux)
-const YTDLP = '/usr/local/bin/yt-dlp';
+// Create directories
+[DOWNLOADS_DIR, BIN_DIR].forEach(dir => {
+    if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+    }
+});
 
 // Download progress storage
 const downloadProgress = new Map();
 
 // ===================== RATE LIMITING =====================
 const requestCounts = new Map();
-const RATE_LIMIT = 5; // requests per minute per IP
+const RATE_LIMIT = 5;
 const RATE_WINDOW = 60 * 1000;
 
 function rateLimiter(req, res, next) {
@@ -56,7 +60,6 @@ function rateLimiter(req, res, next) {
     next();
 }
 
-// Clean rate limit entries
 setInterval(() => {
     const now = Date.now();
     for (const [ip, data] of requestCounts.entries()) {
@@ -134,6 +137,8 @@ function generateId() {
 // Cleanup every 2 minutes
 setInterval(() => {
     try {
+        if (!fs.existsSync(DOWNLOADS_DIR)) return;
+
         const files = fs.readdirSync(DOWNLOADS_DIR);
         const now = Date.now();
 
@@ -148,7 +153,6 @@ setInterval(() => {
             } catch (e) { }
         });
 
-        // Clean progress entries
         for (const [id, data] of downloadProgress.entries()) {
             if (now - data.timestamp > 5 * 60 * 1000) {
                 downloadProgress.delete(id);
@@ -157,32 +161,81 @@ setInterval(() => {
     } catch (e) { }
 }, 2 * 60 * 1000);
 
-// ===================== SETUP yt-dlp =====================
-async function setupYtDlp() {
-    return new Promise((resolve) => {
+// ===================== DOWNLOAD YT-DLP =====================
+function downloadYtDlp() {
+    return new Promise((resolve, reject) => {
+        // Check if already exists
+        if (fs.existsSync(YTDLP_PATH)) {
+            console.log('✅ yt-dlp already exists at:', YTDLP_PATH);
+            return resolve();
+        }
+
+        // Check if yt-dlp is installed globally
         exec('which yt-dlp', (err, stdout) => {
             if (stdout && stdout.trim()) {
                 console.log('✅ yt-dlp found at:', stdout.trim());
-                resolve();
-            } else {
-                console.log('📥 Installing yt-dlp...');
-                exec('curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && chmod a+rx /usr/local/bin/yt-dlp', (err) => {
-                    if (err) console.error('yt-dlp install error:', err.message);
-                    else console.log('✅ yt-dlp installed');
-                    resolve();
-                });
+                return resolve();
             }
+
+            console.log('📥 Downloading yt-dlp to:', YTDLP_PATH);
+
+            const file = fs.createWriteStream(YTDLP_PATH);
+
+            const download = (url) => {
+                https.get(url, (response) => {
+                    if (response.statusCode === 301 || response.statusCode === 302) {
+                        return download(response.headers.location);
+                    }
+
+                    if (response.statusCode !== 200) {
+                        reject(new Error(`Download failed: ${response.statusCode}`));
+                        return;
+                    }
+
+                    response.pipe(file);
+
+                    file.on('finish', () => {
+                        file.close();
+                        // Make executable
+                        fs.chmodSync(YTDLP_PATH, '755');
+                        console.log('✅ yt-dlp downloaded and ready!');
+                        resolve();
+                    });
+
+                    file.on('error', (err) => {
+                        fs.unlink(YTDLP_PATH, () => { });
+                        reject(err);
+                    });
+
+                }).on('error', (err) => {
+                    fs.unlink(YTDLP_PATH, () => { });
+                    reject(err);
+                });
+            };
+
+            download('https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp');
         });
     });
+}
+
+// Get yt-dlp command
+function getYtDlpCommand() {
+    if (fs.existsSync(YTDLP_PATH)) {
+        return YTDLP_PATH;
+    }
+    return 'yt-dlp'; // Fallback to global
 }
 
 // ===================== API ROUTES =====================
 
 app.get('/api/health', (req, res) => {
+    const ytdlpExists = fs.existsSync(YTDLP_PATH);
     res.json({
         status: 'ok',
+        ytdlp: ytdlpExists ? 'ready' : 'checking...',
         queue: downloadQueue.length,
-        active: processingCount
+        active: processingCount,
+        environment: isProduction ? 'production' : 'development'
     });
 });
 
@@ -192,8 +245,10 @@ app.get('/api/info', rateLimiter, async (req, res) => {
         if (!url) return res.status(400).json({ error: 'URL required' });
         if (!/youtube\.com|youtu\.be/i.test(url)) return res.status(400).json({ error: 'Invalid URL' });
 
+        const ytdlp = getYtDlpCommand();
+
         const output = await new Promise((resolve, reject) => {
-            exec(`yt-dlp --dump-json --no-warnings --no-playlist "${url}"`,
+            exec(`"${ytdlp}" --dump-json --no-warnings --no-playlist "${url}"`,
                 { maxBuffer: 50 * 1024 * 1024, timeout: 30000 },
                 (err, stdout, stderr) => {
                     if (err) reject(new Error(stderr || err.message));
@@ -214,6 +269,7 @@ app.get('/api/info', rateLimiter, async (req, res) => {
             }
         });
     } catch (err) {
+        console.error('Info error:', err.message);
         res.status(500).json({ error: 'Failed to get video info' });
     }
 });
@@ -234,7 +290,7 @@ app.post('/api/convert', rateLimiter, async (req, res) => {
     downloadProgress.set(downloadId, {
         status: 'queued',
         progress: 0,
-        message: `Queued (${downloadQueue.length + 1})`,
+        message: `Queued (Position: ${downloadQueue.length + 1})`,
         timestamp,
         filePath: null,
         filename: null
@@ -264,15 +320,20 @@ async function processDownload(downloadId, url, format, quality, timestamp) {
     try {
         update(5, 'Starting...');
 
+        const ytdlp = getYtDlpCommand();
+
+        // Get title
         let title = 'download';
         try {
             const out = await new Promise((resolve, reject) => {
-                exec(`yt-dlp --print title --no-warnings --no-playlist "${url}"`,
+                exec(`"${ytdlp}" --print title --no-warnings --no-playlist "${url}"`,
                     { timeout: 20000 },
                     (err, stdout) => err ? reject(err) : resolve(stdout.trim()));
             });
             title = sanitize(out);
-        } catch (e) { }
+        } catch (e) {
+            console.log('Could not get title:', e.message);
+        }
 
         update(10, 'Downloading...');
 
@@ -282,14 +343,33 @@ async function processDownload(downloadId, url, format, quality, timestamp) {
 
         let args = [];
         if (format === 'mp3') {
-            args = ['-x', '--audio-format', 'mp3', '--audio-quality', `${quality}K`, '--no-playlist', '--no-warnings', '--newline', '-o', outputPath, url];
+            args = [
+                '-x',
+                '--audio-format', 'mp3',
+                '--audio-quality', `${quality}K`,
+                '--no-playlist',
+                '--no-warnings',
+                '--newline',
+                '-o', outputPath,
+                url
+            ];
         } else {
             const fmt = `bestvideo[height<=${quality}]+bestaudio/best[height<=${quality}]/best`;
-            args = ['-f', fmt, '--merge-output-format', 'mp4', '--no-playlist', '--no-warnings', '--newline', '-o', outputPath, url];
+            args = [
+                '-f', fmt,
+                '--merge-output-format', 'mp4',
+                '--no-playlist',
+                '--no-warnings',
+                '--newline',
+                '-o', outputPath,
+                url
+            ];
         }
 
+        console.log(`🎬 Processing: ${title}`);
+
         await new Promise((resolve, reject) => {
-            const proc = spawn('yt-dlp', args);
+            const proc = spawn(ytdlp, args);
 
             proc.stdout.on('data', (data) => {
                 const match = data.toString().match(/(\d+\.?\d*)%/);
@@ -300,17 +380,27 @@ async function processDownload(downloadId, url, format, quality, timestamp) {
             });
 
             proc.stderr.on('data', (data) => {
-                const match = data.toString().match(/(\d+\.?\d*)%/);
+                const output = data.toString();
+                const match = output.match(/(\d+\.?\d*)%/);
                 if (match) {
                     const pct = parseFloat(match[1]);
                     update(Math.min(10 + pct * 0.85, 95), `Downloading: ${Math.round(pct)}%`);
                 }
+                // Log errors but don't fail immediately
+                if (output.includes('ERROR')) {
+                    console.error('yt-dlp error:', output);
+                }
             });
 
-            proc.on('close', (code) => code === 0 ? resolve() : reject(new Error(`Exit ${code}`)));
+            proc.on('close', (code) => {
+                if (code === 0) resolve();
+                else reject(new Error(`Process exited with code ${code}`));
+            });
+
             proc.on('error', reject);
         });
 
+        // Find the output file
         let finalPath = outputPath;
         if (!fs.existsSync(outputPath)) {
             const files = fs.readdirSync(DOWNLOADS_DIR);
@@ -318,7 +408,9 @@ async function processDownload(downloadId, url, format, quality, timestamp) {
             if (match) finalPath = path.join(DOWNLOADS_DIR, match);
         }
 
-        if (!fs.existsSync(finalPath)) throw new Error('File not created');
+        if (!fs.existsSync(finalPath)) {
+            throw new Error('File not created');
+        }
 
         const stats = fs.statSync(finalPath);
         const sizeMB = (stats.size / 1024 / 1024).toFixed(2);
@@ -332,7 +424,7 @@ async function processDownload(downloadId, url, format, quality, timestamp) {
             data.fileSize = stats.size;
         }
 
-        console.log(`✅ Done: ${filename}`);
+        console.log(`✅ Done: ${filename} (${sizeMB} MB)`);
 
     } catch (err) {
         console.error('❌ Error:', err.message);
@@ -398,22 +490,40 @@ app.get('/api/download/:id', (req, res) => {
 app.get('*', (req, res) => {
     const indexPath = path.join(__dirname, 'public', 'index.html');
     if (fs.existsSync(indexPath)) res.sendFile(indexPath);
-    else res.send('<h1>Server Running</h1>');
+    else res.send('<h1>TubeGrab Server Running!</h1><p>Frontend not found.</p>');
 });
 
-// ===================== START =====================
+// ===================== START SERVER =====================
 async function start() {
-    console.log('🔧 Setting up...');
-    await setupYtDlp();
+    console.log('');
+    console.log('🔧 Setting up TubeGrab...');
+    console.log('📁 Downloads dir:', DOWNLOADS_DIR);
+    console.log('📁 Bin dir:', BIN_DIR);
+    console.log('');
+
+    try {
+        await downloadYtDlp();
+    } catch (err) {
+        console.error('⚠️ yt-dlp setup warning:', err.message);
+        console.log('   Will try to use system yt-dlp or download on first request');
+    }
 
     app.listen(PORT, () => {
         console.log('');
-        console.log('╔════════════════════════════════════════════╗');
-        console.log('║   🎵 YOUTUBE DOWNLOADER - READY!          ║');
-        console.log('╠════════════════════════════════════════════╣');
-        console.log(`║   🌐 Port: ${PORT}                            ║`);
-        console.log('║   ✅ Free tier optimized                  ║');
-        console.log('╚════════════════════════════════════════════╝');
+        console.log('╔════════════════════════════════════════════════════╗');
+        console.log('║                                                    ║');
+        console.log('║   🎵 TUBEGRAB - READY!                            ║');
+        console.log('║                                                    ║');
+        console.log('╠════════════════════════════════════════════════════╣');
+        console.log('║                                                    ║');
+        console.log(`║   🌐 Port: ${PORT}                                    ║`);
+        console.log(`║   📂 Mode: ${isProduction ? 'Production' : 'Development'}                       ║`);
+        console.log('║                                                    ║');
+        console.log('║   ✅ YouTube to MP3                               ║');
+        console.log('║   ✅ YouTube to MP4                               ║');
+        console.log('║   ✅ Real-time progress                           ║');
+        console.log('║                                                    ║');
+        console.log('╚════════════════════════════════════════════════════╝');
         console.log('');
     });
 }
