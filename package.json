@@ -1,0 +1,25 @@
+{
+    "name": "tubegrab",
+    "version": "1.0.0",
+    "description": "YouTube to MP3/MP4 Converter - Free & Fast",
+    "main": "server.js",
+    "scripts": {
+        "start": "node server.js"
+    },
+    "dependencies": {
+        "express": "^4.21.0",
+        "cors": "^2.8.5"
+    },
+    "engines": {
+        "node": ">=18.0.0"
+    },
+    "keywords": [
+        "youtube",
+        "downloader",
+        "mp3",
+        "mp4",
+        "converter"
+    ],
+    "author": "Hamja",
+    "license": "MIT"
+}

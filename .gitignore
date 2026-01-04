@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Downloads folder
+downloads/
+
+# Binary files
+bin/
+*.exe
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Temp files
+tmp/
+temp/
